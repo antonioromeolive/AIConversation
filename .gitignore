@@ -1,0 +1,10 @@
+#File aggiornato il 01/12/2025 alle 16:51 da Antonio Romeo
+# Ignora tutto in .vscode
+__pycache__/*
+test/__pycache__/*
+.vscode/*
+.claude/*
+conv/*
+*.conv.txt
+*.chat.txt
+*.db
