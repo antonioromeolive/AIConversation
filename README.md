@@ -151,7 +151,8 @@ The rules:
 
 ## Message types
 
-`AIC_TYPE_TEXT`, `AIC_TYPE_IMAGE_URL`, `AIC_TYPE_FILE`, `AIC_TYPE_INTERNAL`, `AIC_TYPE_REASONING`.
+`AIC_TYPE_TEXT`, `AIC_TYPE_IMAGE_URL`, `AIC_TYPE_FILE`, `AIC_TYPE_INTERNAL`, `AIC_TYPE_REASONING`,
+`AIC_TYPE_TOOL_CALL`, `AIC_TYPE_TOOL_RESULT`.
 
 ```python
 conv.add_message(rc.ROLE_USER, "What is in this picture?",
@@ -167,17 +168,36 @@ Not every role accepts every type. The contract is declared once in
 `rom_const.AIC_ALLOWED_TYPES_BY_ROLE` and enforced by the `AIMessage` constructor (on construction
 **and** on load), which raises `ValueError` on any pair outside the table:
 
-| role | text | image_url | file | internal | reasoning |
-|-------------|:----:|:---------:|:----:|:--------:|:---------:|
-| `system`    |  ✅  |           |      |          |           |
-| `developer` |  ✅  |           |      |          |           |
-| `user`      |  ✅  |    ✅     |  ✅  |          |           |
-| `assistant` |  ✅  |    ✅     |  ✅  |          |    ✅     |
-| `internal`  |      |           |      |    ✅    |           |
+| role | text | image_url | file | internal | reasoning | tool_call | tool_result |
+|-------------|:----:|:---------:|:----:|:--------:|:---------:|:---------:|:-----------:|
+| `system`    |  ✅  |           |      |          |           |           |             |
+| `developer` |  ✅  |           |      |          |           |           |             |
+| `user`      |  ✅  |    ✅     |  ✅  |          |           |           |             |
+| `assistant` |  ✅  |    ✅     |  ✅  |          |    ✅     |    ✅     |             |
+| `tool`      |      |           |      |          |           |           |     ✅      |
+| `internal`  |      |           |      |    ✅    |           |           |             |
 
-So an **internal** message carries only its command text — never an image — and **reasoning** is an
-assistant-only kind of output. To change the policy, edit the table; the errors and this behaviour
-follow automatically.
+So an **internal** message carries only its command text — never an image — **reasoning** and a
+**tool call** are assistant-only kinds of output, and a **tool** says exactly one thing: its result.
+To change the policy, edit the table; the errors and this behaviour follow automatically.
+
+### Tool messages are recorded, never resent
+
+The `tools` schema list is a request parameter like `model`, so the caller owns it — and the caller
+owns the tool **loop** too (send, get `tool_calls` back, run them, send the results, repeat),
+assembling that in-flight turn in its own list. What the conversation does is **record** the traffic
+afterwards, so the history is faithful and the saved file is complete:
+
+```python
+conv.add_tool_call([{"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+                    for tc in msg.tool_calls], model="gpt-4o")
+conv.add_tool_result(tc.id, result_text, tool_name=tc.function.name)
+```
+
+Recorded tool messages appear in the history and in `print()`, cost 0 tokens, and **never re-enter
+memory** — there is deliberately no `add_tools=True`. A tool call and its results form one block the
+API validates as a unit (a missing half is a hard 400), and a count-based window cannot promise to
+keep a block whole. The full loop, runnable without a network, is section 10 of `sample_usage.py`.
 
 ---
 

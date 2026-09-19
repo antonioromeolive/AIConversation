@@ -16,6 +16,14 @@
 # Anything the caller knows and this module does not (which model, what it supports) is passed IN,
 # e.g. strip_types={AIC_TYPE_IMAGE_URL} to degrade images for a model without vision.
 #
+# TOOLS follow the same rule, one step further. The `tools` schema list is a request parameter like
+# `model`, so the caller owns it. The tool LOOP (send, get tool_calls back, run them, send results,
+# repeat) is the caller's too: it assembles that in-flight turn in its own list, because a tool call
+# and its results form one block the API validates as a unit, and a count-based memory window cannot
+# promise to keep a block whole. What this module does is RECORD the traffic afterwards, through
+# add_tool_call() / add_tool_result(), so the history is faithful and the saved file is complete.
+# Recorded tool messages never re-enter memory. See sample_usage.py for the loop.
+#
 # MIT License (see the LICENSE file distributed with this project)
 
 import base64
@@ -43,19 +51,32 @@ class AIMessageContent:
         endpoint's request format: only this class knows the block layout.
 
         Supported types (rom_const): AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE,
-        AIC_TYPE_INTERNAL and AIC_TYPE_REASONING.
+        AIC_TYPE_INTERNAL, AIC_TYPE_REASONING, AIC_TYPE_TOOL_CALL and AIC_TYPE_TOOL_RESULT.
 
         Images and files may be given as an http URL, as a "data:" URL, or as a local path: a local
         path is READ AND BASE64 ENCODED at construction, and the stored url becomes the data URL.
         The original path is not kept.
+
+        The tool fields are keyword-only, so the four positional parameters above keep their
+        meaning for every caller written before tools existed:
+          - tool_calls   (AIC_TYPE_TOOL_CALL)   a list of {"id", "name", "arguments"} dicts.
+                         `arguments` is the JSON STRING exactly as the endpoint sent it: it must be
+                         echoed back byte for byte, and re-serialising a parsed dict reorders keys.
+          - tool_call_id (AIC_TYPE_TOOL_RESULT) the id of the call this result answers.
+          - tool_name    (AIC_TYPE_TOOL_RESULT) the tool that produced it. Optional, for display.
     """
-    def __init__(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "") -> None:
+    def __init__(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "",
+                 *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         self.__content:  list[dict[str, Any]] = []
         self.__type: str = msg_type
         self.__image_url: "str | None" = msg_image_url
         self.__file_url: "str | None" = msg_file_url
         self.__text: str = msg_text
-        self.set_content(msg_type, msg_image_url, msg_text, msg_file_url)
+        self.__tool_calls: list[dict[str, Any]] = []
+        self.__tool_call_id: str = ""
+        self.__tool_name: str = ""
+        self.set_content(msg_type, msg_image_url, msg_text, msg_file_url,
+                         tool_calls=tool_calls, tool_call_id=tool_call_id, tool_name=tool_name)
 
 
     def to_dict(self)-> dict[str, Any]:
@@ -66,17 +87,21 @@ class AIMessageContent:
             'type': self.__type,
             'image_url': self.__image_url,
             'file_url': self.__file_url,
-            'text': self.__text
+            'text': self.__text,
+            'tool_calls': self.__tool_calls,
+            'tool_call_id': self.__tool_call_id,
+            'tool_name': self.__tool_name
         }
         return my_dict_version
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d['type'], d.get('image_url', ''), d.get('text', ''), d.get('file_url', ''))
-    
+        return cls(d['type'], d.get('image_url', ''), d.get('text', ''), d.get('file_url', ''),
+                   tool_calls=d.get('tool_calls'), tool_call_id=d.get('tool_call_id', ''), tool_name=d.get('tool_name', ''))
+
     def get_type(self) -> str:
         return self.__type
-    
+
     def get_image_url(self) -> "str | None":
         return self.__image_url
 
@@ -85,11 +110,25 @@ class AIMessageContent:
 
     def get_text(self) -> str:
         return self.__text
-    
+
+    def get_tool_calls(self) -> list[dict[str, Any]]:
+        """ The calls of an AIC_TYPE_TOOL_CALL content, each {"id", "name", "arguments"}.
+            Empty for every other type. The live list: copy it before changing it.
+        """
+        return self.__tool_calls
+
+    def get_tool_call_id(self) -> str:
+        """ The id answered by an AIC_TYPE_TOOL_RESULT content. Empty for every other type. """
+        return self.__tool_call_id
+
+    def get_tool_name(self) -> str:
+        return self.__tool_name
+
     def get_content(self) -> list[dict[str, Any]]:
         return self.__content
-    
-    def set_content(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "") -> None:
+
+    def set_content(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "",
+                    *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         """ Replace the content and rebuild the content blocks returned by get_content().
 
             For AIC_TYPE_IMAGE_URL / AIC_TYPE_FILE a value that is neither an http nor a "data:" URL
@@ -98,12 +137,22 @@ class AIMessageContent:
             url block carries an error string instead, so one unreadable attachment cannot destroy
             a whole conversation being loaded from disk.
 
-            Raises ValueError for an unsupported msg_type.
+            For the tool types the content blocks hold only the text (a tool-call message may carry
+            none at all): the calls and the id are NOT content blocks in any endpoint's format, they
+            are top-level fields of the message, so AIMessage.get_message_payload() places them.
+
+            Raises ValueError for an unsupported msg_type, a tool call with no calls, or a tool
+            result with no id.
         """
         self.__type: str = msg_type
         self.__image_url: "str | None" = msg_image_url
         self.__file_url: "str | None" = msg_file_url
         self.__text: str = msg_text
+        #a defensive copy of every call: the caller's list may be the one it is still appending
+        #results to, and a saved conversation must not change because a caller edited its dict later
+        self.__tool_calls = [dict(call) for call in tool_calls] if tool_calls else []
+        self.__tool_call_id = tool_call_id or ""
+        self.__tool_name = tool_name or ""
 
         if msg_type == rc.AIC_TYPE_IMAGE_URL:
             msg_image_url = msg_image_url or ""
@@ -222,7 +271,30 @@ class AIMessageContent:
                     "type": msg_type,
                     "text": msg_text
                 }
-            ]            
+            ]
+        elif msg_type == rc.AIC_TYPE_TOOL_CALL:
+            if not self.__tool_calls:
+                raise ValueError("AIMessageContent.set_content - a tool_call content needs at least one tool call")
+            for call in self.__tool_calls:
+                if not call.get("id") or not call.get("name"):
+                    raise ValueError(f"AIMessageContent.set_content - every tool call needs an 'id' and a 'name', got {call!r}")
+                #the endpoint gives a JSON string; a caller that built the call by hand may pass a
+                #dict. Normalise to the string form ONCE, here, so the stored record and the
+                #payload never disagree about what the arguments were
+                if not isinstance(call.get("arguments", ""), str):
+                    call["arguments"] = json.dumps(call["arguments"])
+                call.setdefault("arguments", "")
+            #a text block only when there is text: models frequently call a tool and say nothing
+            self.__content = [{"type": rc.AIC_TYPE_TEXT, "text": msg_text}] if msg_text else []
+        elif msg_type == rc.AIC_TYPE_TOOL_RESULT:
+            if not self.__tool_call_id:
+                raise ValueError("AIMessageContent.set_content - a tool_result content needs the tool_call_id it answers")
+            self.__content = [
+                {
+                    "type": rc.AIC_TYPE_TEXT,
+                    "text": msg_text
+                }
+            ]
         else:
             raise ValueError("AIMessageContent.set_content - Invalid message type: " + msg_type)
         
@@ -243,6 +315,12 @@ class AIMessageContent:
             result = f"Text: {self.__text}"
         elif self.__type == rc.AIC_TYPE_REASONING:
             result = f"Text: {self.__text}"
+        elif self.__type == rc.AIC_TYPE_TOOL_CALL:
+            calls = "\n".join(f"  -> {call['name']}({call.get('arguments', '')}) [{call['id']}]" for call in self.__tool_calls)
+            result = f"Tool calls:\n{calls}" + (f"\nText: {self.__text}" if self.__text else "")
+        elif self.__type == rc.AIC_TYPE_TOOL_RESULT:
+            name = f" {self.__tool_name}" if self.__tool_name else ""
+            result = f"Tool result{name} [{self.__tool_call_id}]: {self.__text}"
         return result
 
 
@@ -257,32 +335,40 @@ class AIMessage:
         message so a reader can tell who said what. It is never sent as a request parameter - the
         calling program supplies the target model when it builds the request.
     """
-    def __init__(self, role: str, content_text:str, msg_type:str, content_image_url:"str | None" = None, sticky:bool = False, content_file_url:"str | None" = None, model:str = "") -> None:
+    def __init__(self, role: str, content_text:str, msg_type:str, content_image_url:"str | None" = None, sticky:bool = False, content_file_url:"str | None" = None, model:str = "",
+                 *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         """ Build a message. Every type validates its own required content.
 
         Args:
-            role: one of ROLE_USER, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_DEVELOPER, ROLE_INTERNAL.
+            role: one of ROLE_USER, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_DEVELOPER, ROLE_TOOL, ROLE_INTERNAL.
             content_text: the text of the message. Required for every type except AIC_TYPE_IMAGE_URL
-                and AIC_TYPE_FILE, where it acts as the caption and may be empty.
+                and AIC_TYPE_FILE, where it acts as the caption and may be empty, and the two tool
+                types, where it may be empty too (a model often calls a tool and says nothing, and a
+                tool may legitimately return nothing).
             msg_type: one of AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE, AIC_TYPE_INTERNAL,
-                AIC_TYPE_REASONING - but only if the role is allowed to carry it, see below.
+                AIC_TYPE_REASONING, AIC_TYPE_TOOL_CALL, AIC_TYPE_TOOL_RESULT - but only if the role
+                is allowed to carry it, see below.
             content_image_url: required for AIC_TYPE_IMAGE_URL. http URL, "data:" URL or local path.
             sticky: sticky messages survive the memory window, see set_sticky().
             content_file_url: required for AIC_TYPE_FILE. Same accepted forms as the image url.
             model: provenance, the model that produced or received this message. Optional.
+            tool_calls: required for AIC_TYPE_TOOL_CALL. See AIMessageContent.
+            tool_call_id: required for AIC_TYPE_TOOL_RESULT. See AIMessageContent.
+            tool_name: optional for AIC_TYPE_TOOL_RESULT.
 
         The (role, type) contract is declared once in rc.AIC_ALLOWED_TYPES_BY_ROLE and enforced here:
         system/developer carry text only, user carries text/image/file, assistant carries those plus
-        reasoning, and internal carries only its command text. An internal message therefore cannot
-        hold an image, and reasoning is an assistant-only kind of output.
+        reasoning and tool calls, tool carries only a tool result, and internal carries only its
+        command text. An internal message therefore cannot hold an image, and reasoning is an
+        assistant-only kind of output.
 
         Raises:
             ValueError: unknown role, unknown type, the content required by that type is missing, or a
                 (role, type) pair the contract forbids (e.g. an image on an internal message).
 
         Notes:
-            - Token estimates are computed here and refreshed by set_text(). AIC_TYPE_INTERNAL always
-              costs 0 tokens because internal messages are never sent to a model.
+            - Token estimates are computed here and refreshed by set_text(). AIC_TYPE_INTERNAL,
+              AIC_TYPE_REASONING and the tool types cost 0: see __refresh_estimated_tokens().
             - set_text() changes the text in place; set_content() replaces the whole content and
               expects an AIMessageContent object.
         """
@@ -312,7 +398,8 @@ class AIMessage:
         if allowed_types is None:
             raise ValueError(f"AIMessage.__init__ - Invalid message role: {role!r}")
 
-        if (msg_type not in [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE, rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING]):
+        if (msg_type not in [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE, rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING,
+                             rc.AIC_TYPE_TOOL_CALL, rc.AIC_TYPE_TOOL_RESULT]):
             raise ValueError(f"AIMessage.__init__ - Invalid message type: {msg_type!r}")
 
         if (msg_type not in allowed_types):
@@ -343,6 +430,12 @@ class AIMessage:
             if content_file_url is None or content_file_url == "":
                 raise ValueError("Missing File URL for " + msg_type + " message")
             self.__content = AIMessageContent(rc.AIC_TYPE_FILE, msg_file_url=content_file_url, msg_text=content_text)
+        elif (msg_type == rc.AIC_TYPE_TOOL_CALL):
+            #the text is optional here; the calls are not, and AIMessageContent checks them
+            self.__content = AIMessageContent(rc.AIC_TYPE_TOOL_CALL, None, content_text, tool_calls=tool_calls)
+        elif (msg_type == rc.AIC_TYPE_TOOL_RESULT):
+            #an empty result is a legal result; a missing id is not, and AIMessageContent checks it
+            self.__content = AIMessageContent(rc.AIC_TYPE_TOOL_RESULT, None, content_text, tool_call_id=tool_call_id, tool_name=tool_name)
         else:
             raise ValueError("AIMessage.__init__ - Invalid message type: " + msg_type)
 
@@ -352,10 +445,17 @@ class AIMessage:
         """ Recompute the token estimate from the CURRENT content. Single source of truth for the
             per-type rules, used both at construction and whenever the text is replaced.
 
-            - INTERNAL and REASONING messages are never sent to AI as part of memory, so they always
-              cost 0. Reasoning is model output the user paid to generate, but it is excluded from
-              the memory the model sees (see __may_enter_memory), so counting its tokens would only
-              inflate the memory estimate with text that is never sent. Treat it like INTERNAL.
+            WHAT THIS NUMBER IS: an estimate of what this message will contribute to the NEXT
+            REQUEST - "what is this conversation going to cost me to send" - not a record of what
+            has already been spent. That one choice decides the rules:
+
+            - INTERNAL costs 0: never sent to anything, by anyone.
+            - REASONING and the two TOOL types cost 0, and that is NOT a claim that they were free.
+              Reasoning was billed, as output tokens, when the model generated it; tool traffic was
+              sent and billed by the caller during the tool loop. But none of them is ever part of
+              memory (see AIConversation.__may_enter_memory), so none will be sent again - and it
+              is the cost of the next request this number estimates. Money already spent is out of
+              scope; the authoritative figure for that is the `usage` block the API returns.
             - Every other type costs the tokens of its text, plus (for images) the cached image cost.
 
             The image cost is deliberately NOT recomputed here: it is derived once in __init__ from the
@@ -363,7 +463,7 @@ class AIMessage:
             estimate of an image message just because its text was edited (a local file path gets
             normalised into a much longer base64 data URL by AIMessageContent).
         """
-        if self.__content.get_type() in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING):
+        if self.__content.get_type() in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING) or self.__content.get_type() in rc.AIC_TOOL_TYPES:
             self.__estimated_tokens = 0     #not sent to AI as part of memory, so no token no cry
         else:
             self.__estimated_tokens = self.__image_tokens + self.num_tokens_from_string(self.__content.get_text())
@@ -432,6 +532,13 @@ class AIMessage:
             'sticky': self.__sticky,
             'model': self.__model
         }
+        #the tool fields are written only when they carry something, so a file holding no tool
+        #traffic looks exactly as it did before tools existed
+        if self.__content.get_tool_calls():
+            my_dict_version['tool_calls'] = self.__content.get_tool_calls()
+        if self.__content.get_tool_call_id():
+            my_dict_version['tool_call_id'] = self.__content.get_tool_call_id()
+            my_dict_version['tool_name'] = self.__content.get_tool_name()
         return my_dict_version
     
     def to_string(self) -> str:
@@ -455,7 +562,10 @@ class AIMessage:
             content_image_url = d.get('content_image_url', None),
             sticky = bool(d.get('sticky', False)),
             content_file_url = d.get('content_file_url', None),
-            model = d.get('model', '')
+            model = d.get('model', ''),
+            tool_calls = d.get('tool_calls', None),
+            tool_call_id = d.get('tool_call_id', ''),
+            tool_name = d.get('tool_name', '')
         )
         
     def get_type(self) -> str:
@@ -478,12 +588,30 @@ class AIMessage:
             NOTE: callers holding this message inside an AIConversation should call
             AIConversation.recalculate_tokens() afterwards so the conversation totals follow.
         """
-        self.__content.set_content(self.__content.get_type(), self.__content.get_image_url(), text, self.__content.get_file_url())
+        #every semantic field but the text is carried over: editing the text of a tool message must
+        #not silently drop its calls or its id
+        self.__content.set_content(self.__content.get_type(), self.__content.get_image_url(), text, self.__content.get_file_url(),
+                                   tool_calls=self.__content.get_tool_calls(),
+                                   tool_call_id=self.__content.get_tool_call_id(),
+                                   tool_name=self.__content.get_tool_name())
         self.__refresh_estimated_tokens()
         return
-    
+
     def get_role(self) -> str:
         return self.__role
+
+    def get_tool_calls(self) -> list[dict[str, Any]]:
+        """ The calls of an AIC_TYPE_TOOL_CALL message, each {"id", "name", "arguments"}.
+            Empty for every other type.
+        """
+        return self.__content.get_tool_calls()
+
+    def get_tool_call_id(self) -> str:
+        """ The id an AIC_TYPE_TOOL_RESULT message answers. Empty for every other type. """
+        return self.__content.get_tool_call_id()
+
+    def get_tool_name(self) -> str:
+        return self.__content.get_tool_name()
 
     def set_role(self, role: str) -> None:
         """ Change the role of the message, subject to the same (role, type) contract the constructor
@@ -564,12 +692,39 @@ class AIMessage:
             token estimate, model provenance - is bookkeeping and stays behind.
 
             Normally reached through AIConversation.get_memory_messages_for_ai().
+
+            The two tool types are the exception to "content is a list of blocks": they follow the
+            OpenAI tool-calling shape, where the calls and the id are TOP-LEVEL fields and `content`
+            is a plain string (or null). That is not a stylistic choice - the OpenAI-compatible
+            servers this module targets (Ollama, LM Studio, llama.cpp) reject a block list on a
+            tool message. NOTE that no default path emits these: memory never contains tool traffic
+            (see AIConversation.__may_enter_memory), so this branch exists for a caller rebuilding
+            a turn by hand, and it is exercised only by its own test.
         """
-        payload = {
-            "role": self.get_role(),
-            #"sticky": self.is_sticky(),
-            "content": self.get_content().get_content()
-        }
+        msg_type: str = self.get_type()
+
+        if msg_type == rc.AIC_TYPE_TOOL_CALL:
+            payload = {
+                "role": self.get_role(),
+                "content": self.get_text() or None,
+                "tool_calls": [
+                    {"id": call["id"], "type": "function",
+                     "function": {"name": call["name"], "arguments": call.get("arguments", "")}}
+                    for call in self.get_tool_calls()
+                ]
+            }
+        elif msg_type == rc.AIC_TYPE_TOOL_RESULT:
+            payload = {
+                "role": self.get_role(),
+                "tool_call_id": self.get_tool_call_id(),
+                "content": self.get_text()
+            }
+        else:
+            payload = {
+                "role": self.get_role(),
+                #"sticky": self.is_sticky(),
+                "content": self.get_content().get_content()
+            }
         return payload
 
 
@@ -583,8 +738,9 @@ class AIConversation:
 
         MEMORY is the subset a model is allowed to see: the last `max_memory` messages, plus the
         system prompt, plus any sticky messages that fell outside the window, and nothing from
-        before the most recent /NEWTOPIC marker. Internal messages are ALWAYS excluded, and
-        reasoning messages are excluded unless add_reasoning=True.
+        before the most recent /NEWTOPIC marker. Internal messages are ALWAYS excluded, tool
+        messages (calls and results) are ALWAYS excluded, and reasoning messages are excluded
+        unless add_reasoning=True.
 
         Message 0 is always the system prompt and is never removed by restart() or remove_*().
 
@@ -867,23 +1023,26 @@ class AIConversation:
         return
 
 
-    def add_message(self, msg_role:str, msg_text:str, msg_type:str=rc.AIC_TYPE_TEXT, image_url:"str | None" = None, is_sticky = False, file_url:"str | None" = None, model:str = "") -> None:
+    def add_message(self, msg_role:str, msg_text:str, msg_type:str=rc.AIC_TYPE_TEXT, image_url:"str | None" = None, is_sticky = False, file_url:"str | None" = None, model:str = "",
+                    *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         """ Append a message to the conversation.
 
-            User, assistant and internal messages are appended, as many as you like. A SYSTEM or
-            DEVELOPER message is not appended: it REPLACES message 0, so a conversation always has
-            exactly one system prompt and it always sits at the front.
+            User, assistant, tool and internal messages are appended, as many as you like. A SYSTEM
+            or DEVELOPER message is not appended: it REPLACES message 0, so a conversation always
+            has exactly one system prompt and it always sits at the front.
 
             Token counters are recalculated on every call.
 
             Args:
-                msg_role: ROLE_USER, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_DEVELOPER or ROLE_INTERNAL.
+                msg_role: ROLE_USER, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_DEVELOPER, ROLE_TOOL or ROLE_INTERNAL.
                 msg_text: the text of the message (the caption, for an image or file message).
                 msg_type: one of the AIC_TYPE_* values. Defaults to AIC_TYPE_TEXT.
                 image_url: required when msg_type is AIC_TYPE_IMAGE_URL.
                 is_sticky: keep this message in memory even once it falls outside the window.
                 file_url: required when msg_type is AIC_TYPE_FILE.
                 model: provenance, which model produced or received this message.
+                tool_calls, tool_call_id, tool_name: the tool fields, keyword-only. Prefer the
+                    named wrappers add_tool_call() and add_tool_result(), which document them.
 
             Raises:
                 ValueError: unknown role or type, content missing for the given type, or
@@ -891,23 +1050,65 @@ class AIConversation:
         """
         #the prompt at message 0 is always sticky, like the one __init__ and change_system_message() install
         is_still_sticky:bool = is_sticky or msg_role in [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER]
-        if msg_role not in [rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_SYSTEM, rc.ROLE_INTERNAL, rc.ROLE_DEVELOPER]:
+        if msg_role not in [rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_SYSTEM, rc.ROLE_INTERNAL, rc.ROLE_DEVELOPER, rc.ROLE_TOOL]:
             raise ValueError(f"AIConversation.add_message - Invalid message role: {msg_role!r}")
 
-        if msg_type not in [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE, rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING]:
+        if msg_type not in [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE, rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING,
+                            rc.AIC_TYPE_TOOL_CALL, rc.AIC_TYPE_TOOL_RESULT]:
             raise ValueError(f"AIConversation.add_message - Invalid message type: {msg_type!r}")
 
-        new_msg = AIMessage(msg_role, msg_text, msg_type, image_url, is_still_sticky, file_url, model)
+        new_msg = AIMessage(msg_role, msg_text, msg_type, image_url, is_still_sticky, file_url, model,
+                            tool_calls=tool_calls, tool_call_id=tool_call_id, tool_name=tool_name)
 
         if msg_role in [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER]:
             if len(self.__messages) >= 1:
                 self.__messages[0] = new_msg
             else:
                 self.__messages.append(new_msg)
-        elif msg_role in [rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_INTERNAL]:
+        elif msg_role in [rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_INTERNAL, rc.ROLE_TOOL]:
             self.__messages.append(new_msg)
 
         self.recalculate_tokens()
+        return
+
+    def add_tool_call(self, tool_calls:list[dict[str, Any]], text:str = "", model:str = "") -> None:
+        """ Record that the assistant asked for one or more tools to be run.
+
+            Each entry of `tool_calls` is {"id": ..., "name": ..., "arguments": ...}, with
+            `arguments` kept as the raw JSON STRING the endpoint sent: it has to be echoed back byte
+            for byte in the loop, and re-serialising a parsed dict reorders keys and breaks prompt
+            caching. (A dict is accepted and serialised once, for calls built by hand.)
+
+            RECORD ONLY. This message goes into the history and the saved file, and is never sent
+            back as part of memory - the caller runs the tool loop from its own list, see the module
+            header and sample_usage.py. It costs 0 tokens for the same reason.
+
+            A consequence worth knowing: while a tool loop is running the caller resends its own list,
+            tool traffic included, on every iteration - so a turn that calls tools costs more than
+            this class's counters show. That list belongs to the caller, the only party that knows
+            how big it got.
+
+            Args:
+                tool_calls: the calls, one dict each. At least one.
+                text: whatever prose the model produced alongside the calls. Usually empty.
+                model: provenance, the model that made the calls.
+        """
+        self.add_message(rc.ROLE_ASSISTANT, text, rc.AIC_TYPE_TOOL_CALL, model=model, tool_calls=tool_calls)
+        return
+
+    def add_tool_result(self, tool_call_id:str, result_text:str, tool_name:str = "") -> None:
+        """ Record what one tool returned. `tool_call_id` is the id of the call it answers, and every
+            call recorded by add_tool_call() should get exactly one result - that is what the API
+            demanded of the caller during the loop, and the history should say the same.
+
+            RECORD ONLY, like add_tool_call(). An empty result is a legal result.
+
+            Args:
+                tool_call_id: the id from the matching tool call.
+                result_text: what the tool returned, as the string the caller sent back.
+                tool_name: the tool that produced it. Optional, for display and for a reader.
+        """
+        self.add_message(rc.ROLE_TOOL, result_text, rc.AIC_TYPE_TOOL_RESULT, tool_call_id=tool_call_id, tool_name=tool_name)
         return
     
     @staticmethod
@@ -919,12 +1120,23 @@ class AIConversation:
             role, but a conversation saved before that rule existed can still hold such a message.
             Reasoning messages only when explicitly asked for: they record HOW an answer was
             reached, which is worth keeping in the history but is not part of the dialogue.
+
+            Tool messages never can either, and deliberately WITHOUT an opt-in flag like
+            add_reasoning. A tool-call message and its results form one atomic block that the API
+            validates as a unit: a result whose call is missing, or a call with a result missing, is
+            a hard 400, not a degraded answer. A count-based window cannot promise to keep a block
+            whole, so offering the flag would hand the caller a hard error from a call that looks
+            harmless. The caller assembles tool traffic for the turn it is running, from its own
+            list; the conversation only records it. See add_tool_call().
         """
         result = True
         if message.get_role() == rc.ROLE_INTERNAL or message.get_type() == rc.AIC_TYPE_INTERNAL:
             result = False
 
         if message.get_type() == rc.AIC_TYPE_REASONING and not add_reasoning:
+            result = False
+
+        if message.get_role() == rc.ROLE_TOOL or message.get_type() in rc.AIC_TOOL_TYPES:
             result = False
 
         return result
@@ -944,8 +1156,12 @@ class AIConversation:
         Reasoning messages (AIC_TYPE_REASONING) are excluded too, unless add_reasoning is True. They
         record how an answer was reached rather than what was said, so they belong to the history.
 
-        Neither kind consumes a slot in the window when excluded: hiding them makes room for more
-        real conversation rather than wasting the budget on messages nobody will see.
+        Tool messages (AIC_TYPE_TOOL_CALL, AIC_TYPE_TOOL_RESULT) are ALWAYS excluded, with no flag to
+        let them back in: see __may_enter_memory() for why. They are a record of the tool loop the
+        caller ran, not something to resend.
+
+        None of these kinds consumes a slot in the window when excluded: hiding them makes room for
+        more real conversation rather than wasting the budget on messages nobody will see.
 
         The function works as follows:
         - Iterates through the messages in reverse order (starting from the most recent).
@@ -1474,6 +1690,7 @@ class AIConversation:
         COLOR_ASSISTANT:str    = "light_green"
         COLOR_SYSTEM:str       = "light_yellow"
         COLOR_INTERNAL:str     = "gray"
+        COLOR_TOOL:str         = "light_magenta"   #tool traffic, both directions: distinct from what anyone SAID
 
         counter:int = 0
         printed_count:int = 0
@@ -1486,7 +1703,9 @@ class AIConversation:
 
             THE_CONTENT_COLOR:str = COLOR_USER
 
-            if current_role == rc.ROLE_USER:
+            if message.get_type() in rc.AIC_TOOL_TYPES:
+                THE_CONTENT_COLOR = COLOR_TOOL      #by TYPE, so the assistant's tool CALL is coloured as tool traffic too
+            elif current_role == rc.ROLE_USER:
                 THE_CONTENT_COLOR = COLOR_USER
             elif current_role == rc.ROLE_ASSISTANT:
                 THE_CONTENT_COLOR = COLOR_ASSISTANT
@@ -1507,7 +1726,9 @@ class AIConversation:
             else:
                 printColorSameLine(f"{message.get_role().upper()}:", COLOR_HEADER)
 
-            printColor(f"{text_content}\n", THE_CONTENT_COLOR)
+            #a tool call usually carries no prose at all: skip the blank line rather than print it
+            if text_content or message.get_type() not in rc.AIC_TOOL_TYPES:
+                printColor(f"{text_content}\n", THE_CONTENT_COLOR)
 
             if message.get_type() == rc.AIC_TYPE_IMAGE_URL:
                 image_url: str = message.get_url() or ""
@@ -1521,10 +1742,32 @@ class AIConversation:
                     printColor(f"{file_url[:30]}...{file_url[-30:]}", THE_CONTENT_COLOR)
                 else:
                     printColor(f"{file_url}", THE_CONTENT_COLOR)
+            elif message.get_type() in rc.AIC_TOOL_TYPES:
+                for line in self.__tool_lines(message):
+                    printColor(line, THE_CONTENT_COLOR)
             printed_count += 1
             counter += 1
 
         return printed_count
+
+
+    @staticmethod
+    def __tool_lines(message:AIMessage) -> list[str]:
+        """ The tool part of a tool message, one line per call or result, for print().
+            Long argument strings are cut the way data URLs are, so one big payload cannot flood
+            the terminal.
+        """
+        lines: list[str] = []
+        if message.get_type() == rc.AIC_TYPE_TOOL_CALL:
+            for call in message.get_tool_calls():
+                args: str = call.get("arguments", "")
+                if len(args) > 200:
+                    args = f"{args[:100]}...{args[-60:]}"
+                lines.append(f"  -> {call['name']}({args})  [{call['id']}]")
+        elif message.get_type() == rc.AIC_TYPE_TOOL_RESULT:
+            name: str = f" {message.get_tool_name()}" if message.get_tool_name() else ""
+            lines.append(f"  <-{name}  [{message.get_tool_call_id()}]")
+        return lines
 
 
     def print_message_No(self, index: int, text_only: bool = False) -> bool:
@@ -1540,7 +1783,9 @@ class AIConversation:
         if -len(self.__messages) <= index < len(self.__messages):
             message = self.__messages[index]
             content_color = "light_white"  # Default to white
-            if message.get_role() == rc.ROLE_USER:
+            if message.get_type() in rc.AIC_TOOL_TYPES:
+                content_color = "light_magenta"
+            elif message.get_role() == rc.ROLE_USER:
                 content_color = "light_white"
             elif message.get_role() == rc.ROLE_ASSISTANT:
                 content_color = "light_green"
@@ -1549,7 +1794,8 @@ class AIConversation:
 
             if not text_only:
                 printColor(f"{index} ------------------------------------------ {message.get_role().upper()} (type={message.get_type()}, sticky={message.is_sticky()}):", "light_cyan")
-            printColor(f"{message.get_text()}\n", content_color)
+            if message.get_text() or message.get_type() not in rc.AIC_TOOL_TYPES:
+                printColor(f"{message.get_text()}\n", content_color)
 
             if message.get_type() == rc.AIC_TYPE_IMAGE_URL:
                 image_url: str = message.get_url() or ""
@@ -1563,6 +1809,9 @@ class AIConversation:
                     printColor(f"{file_url[:30]}...{file_url[-30:]}", content_color)
                 else:
                     printColor(file_url, content_color)
+            elif message.get_type() in rc.AIC_TOOL_TYPES:
+                for line in self.__tool_lines(message):
+                    printColor(line, content_color)
             result = True
         else:
             print(f"Invalid message index: {index}. Must be between {-len(self.__messages)} and {len(self.__messages) - 1}.")

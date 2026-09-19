@@ -49,10 +49,11 @@ def run_tests() -> bool:
     #small probes for "does this input get refused?". They return True when the call SUCCEEDS,
     #so a rejection test reads as `not _accepts(...)`.
     def _accepts(role:"str | None", text:str, msg_type:str, image_url:"str | None" = None,
-                 file_url:"str | None" = None) -> bool:
+                 file_url:"str | None" = None, tool_calls:"list | None" = None, tool_call_id:str = "") -> bool:
         """ Build a message in isolation: probing validation must not mutate the conversation. """
         try:
-            AIMessage(role, text, msg_type, image_url, content_file_url=file_url)
+            AIMessage(role, text, msg_type, image_url, content_file_url=file_url,
+                      tool_calls=tool_calls, tool_call_id=tool_call_id)
             return True
         except ValueError:
             return False
@@ -72,15 +73,19 @@ def run_tests() -> bool:
     #used to sweep the whole matrix: a legal pair must build, so its required content must be present,
     #otherwise a missing-content failure would masquerade as a contract failure.
     _ALL_TYPES = [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE,
-                  rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING]
-    _ALL_ROLES = [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER, rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_INTERNAL]
+                  rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING,
+                  rc.AIC_TYPE_TOOL_CALL, rc.AIC_TYPE_TOOL_RESULT]
+    _ALL_ROLES = [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER, rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_TOOL, rc.ROLE_INTERNAL]
+    _A_CALL    = [{"id": "call_t", "name": "probe", "arguments": "{}"}]   #the minimal legal tool call
 
     def _accepts_pair(role:str, msg_type:str) -> bool:
         """ Can this (role, type) pair build when its required content IS supplied? Isolates the
             contract from the per-type content rules. """
         return _accepts(role, "content",  msg_type,
-                        image_url = "http://x/y.png" if msg_type == rc.AIC_TYPE_IMAGE_URL else None,
-                        file_url  = "http://x/y.pdf" if msg_type == rc.AIC_TYPE_FILE else None)
+                        image_url    = "http://x/y.png" if msg_type == rc.AIC_TYPE_IMAGE_URL else None,
+                        file_url     = "http://x/y.pdf" if msg_type == rc.AIC_TYPE_FILE else None,
+                        tool_calls   = _A_CALL if msg_type == rc.AIC_TYPE_TOOL_CALL else None,
+                        tool_call_id = "call_t" if msg_type == rc.AIC_TYPE_TOOL_RESULT else "")
 
 
     def _reads(conversation:AIConversation, index:int) -> bool:
@@ -155,7 +160,7 @@ def run_tests() -> bool:
 
     _section("2b. Every wrong (role, type) message is refused")
 
-    #Sweep the ENTIRE 5x5 grid against the declared contract. For each pair, supply the content that
+    #Sweep the ENTIRE 6x7 grid against the declared contract. For each pair, supply the content that
     #type needs, so the only thing under test is whether the pair itself is allowed. The table is the
     #oracle: this proves the constructor actually consults it, in every cell, not just the few probed
     #by hand above. A regression that dropped the pair check would light up here as accepted-when-it-
@@ -185,6 +190,13 @@ def run_tests() -> bool:
         (rc.ROLE_INTERNAL,  rc.AIC_TYPE_IMAGE_URL),
         (rc.ROLE_INTERNAL,  rc.AIC_TYPE_FILE),
         (rc.ROLE_INTERNAL,  rc.AIC_TYPE_REASONING),
+        (rc.ROLE_USER,      rc.AIC_TYPE_TOOL_CALL),     #only the model asks for tools
+        (rc.ROLE_USER,      rc.AIC_TYPE_TOOL_RESULT),   #a result comes from a tool, not a person
+        (rc.ROLE_ASSISTANT, rc.AIC_TYPE_TOOL_RESULT),   #the model does not answer its own calls
+        (rc.ROLE_TOOL,      rc.AIC_TYPE_TEXT),          #a tool says exactly one thing: its result
+        (rc.ROLE_TOOL,      rc.AIC_TYPE_TOOL_CALL),
+        (rc.ROLE_SYSTEM,    rc.AIC_TYPE_TOOL_CALL),
+        (rc.ROLE_INTERNAL,  rc.AIC_TYPE_TOOL_RESULT),
     ]
     for _role, _mtype in _forbidden:
         _check(f"{_role} + {_mtype} refused", not _accepts_pair(_role, _mtype))
@@ -202,6 +214,14 @@ def run_tests() -> bool:
     _check("file with no url refused",          not _accepts(rc.ROLE_USER, "cap", rc.AIC_TYPE_FILE))
     _check("internal with no command refused",  not _accepts(rc.ROLE_INTERNAL, "", rc.AIC_TYPE_INTERNAL))
     _check("reasoning with no text refused",    not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_REASONING))
+    _check("tool call with no calls refused",   not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=[]))
+    _check("tool call missing an id refused",   not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=[{"name": "f"}]))
+    _check("tool call missing a name refused",  not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=[{"id": "x"}]))
+    _check("tool result with no id refused",    not _accepts(rc.ROLE_TOOL, "r", rc.AIC_TYPE_TOOL_RESULT, tool_call_id=""))
+    #...but EMPTY TEXT is legal for both: a model often calls a tool and says nothing, and a tool
+    #may return nothing. Unlike a text message, the text is not the required content here.
+    _check("tool call with no text is legal",   _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=_A_CALL))
+    _check("tool result with no text is legal", _accepts(rc.ROLE_TOOL, "", rc.AIC_TYPE_TOOL_RESULT, tool_call_id="call_t"))
 
     #Unknown role and unknown type stay refused, and a None role must not crash the error path itself.
     _check("unknown role refused",  not _accepts("wizard", "hi", rc.AIC_TYPE_TEXT))
@@ -227,7 +247,9 @@ def run_tests() -> bool:
             for _to in _ALL_ROLES:
                 _probe = AIMessage(_from, "content", _mtype,
                                    "http://x/y.png" if _mtype == rc.AIC_TYPE_IMAGE_URL else None,
-                                   content_file_url = "http://x/y.pdf" if _mtype == rc.AIC_TYPE_FILE else None)
+                                   content_file_url = "http://x/y.pdf" if _mtype == rc.AIC_TYPE_FILE else None,
+                                   tool_calls   = _A_CALL if _mtype == rc.AIC_TYPE_TOOL_CALL else None,
+                                   tool_call_id = "call_t" if _mtype == rc.AIC_TYPE_TOOL_RESULT else "")
                 _should = _mtype in rc.AIC_ALLOWED_TYPES_BY_ROLE[_to]
                 try:
                     _probe.set_role(_to)
@@ -397,6 +419,125 @@ def run_tests() -> bool:
     _check("a reasoning message costs 0 tokens",
            all(m.get_estimated_tokens() == 0 for m in conv.get_history_messages()
                if m.get_type() == rc.AIC_TYPE_REASONING))
+
+
+    # ---------------------------------------------------------------- tool messages
+    _section("5c. Tool messages are recorded, never resent")
+
+    #A tool turn on its own conversation, so the counts below are exact. The caller ran the loop
+    #from its own list; what we test here is only what the conversation does with the RECORD.
+    tconv = AIConversation("tool test", max_memory=6)
+    tconv.add_message(rc.ROLE_USER, "weather in Rome and Paris?")
+    _tokens_before = tconv.get_total_tokens()
+    tconv.add_tool_call([{"id": "call_1", "name": "get_weather", "arguments": '{"city": "Rome"}'},
+                         {"id": "call_2", "name": "get_weather", "arguments": '{"city": "Paris"}'}],
+                        model="m")
+    tconv.add_tool_result("call_1", "18C, clear", tool_name="get_weather")
+    tconv.add_tool_result("call_2", "", tool_name="get_weather")          #an empty result is a result
+    tconv.add_message(rc.ROLE_ASSISTANT, "Rome 18C and clear; no data for Paris.", model="m")
+
+    _hist_types = [m.get_type() for m in tconv.get_history_messages()]
+    _check("history holds the call and both results, in order",
+           _hist_types == [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_TEXT, rc.AIC_TYPE_TOOL_CALL,
+                           rc.AIC_TYPE_TOOL_RESULT, rc.AIC_TYPE_TOOL_RESULT, rc.AIC_TYPE_TEXT])
+    _check("a tool result carries ROLE_TOOL", tconv.get_ith_message(3).get_role() == rc.ROLE_TOOL)
+    _check("a tool call carries ROLE_ASSISTANT", tconv.get_ith_message(2).get_role() == rc.ROLE_ASSISTANT)
+
+    #the rule: never in memory, whatever the flags, and not through get_history_messages_for_ai() either
+    _mem_types = {m.get_type() for m in tconv.get_memory_messages(add_sticky=True, add_reasoning=True)}
+    _check("memory contains no tool call",   rc.AIC_TYPE_TOOL_CALL not in _mem_types)
+    _check("memory contains no tool result", rc.AIC_TYPE_TOOL_RESULT not in _mem_types)
+    _check("memory is the question and the answer only",
+           [m.get_role() for m in tconv.get_memory_messages()] == [rc.ROLE_SYSTEM, rc.ROLE_USER, rc.ROLE_ASSISTANT])
+    _check("no ROLE_TOOL entry in the memory payload",
+           all(p["role"] != rc.ROLE_TOOL for p in tconv.get_memory_messages_for_ai()))
+    _check("no tool_calls key in the memory payload",
+           all("tool_calls" not in p for p in tconv.get_memory_messages_for_ai()))
+    _check("get_history_messages_for_ai() leaves tool traffic out too",
+           all(p["role"] != rc.ROLE_TOOL and "tool_calls" not in p
+               for p in tconv.get_history_messages_for_ai(add_reasoning=True)))
+    _check("tool messages do not use up a window slot",
+           len(tconv.get_memory_messages()) == 3 and tconv.count_all_messages() == 6)
+
+    #a sticky tool message outside the window must stay out: pulling one back alone would orphan it
+    tconv.set_nth_message_stickiness(3, True)
+    tconv.set_max_memory_messages(1)
+    _check("a sticky tool result outside the window stays out",
+           rc.AIC_TYPE_TOOL_RESULT not in {m.get_type() for m in tconv.get_memory_messages(add_sticky=True)})
+    tconv.set_max_memory_messages(6)
+    tconv.set_nth_message_stickiness(3, False)
+
+    #cost: the estimate is "what will the next request cost", and tool traffic is never in it
+    _check("a tool call costs 0 tokens",   tconv.get_ith_message(2).get_estimated_tokens() == 0)
+    _check("a tool result costs 0 tokens", tconv.get_ith_message(3).get_estimated_tokens() == 0)
+    _check("the history total did not move for the tool traffic",
+           tconv.get_total_tokens() == _tokens_before + tconv.get_ith_message(5).get_estimated_tokens())
+    _check("memory totals match the memory selection",
+           tconv.get_memory_total_tokens() == sum(m.get_estimated_tokens() for m in tconv.get_memory_messages()))
+
+    #the payload branch is reachable by no default path (memory never holds tool traffic), so this
+    #is the ONE place it gets exercised: the OpenAI tool shape, calls and id at the top level, and
+    #`content` a plain string or null - a block list here is refused by the local servers targeted
+    _call_payload = tconv.get_ith_message(2).get_message_payload()
+    _check("tool call payload: content is null when there is no text", _call_payload["content"] is None)
+    _check("tool call payload: tool_calls at the top level", len(_call_payload.get("tool_calls", [])) == 2)
+    _check("tool call payload: OpenAI function shape",
+           _call_payload["tool_calls"][0] == {"id": "call_1", "type": "function",
+                                              "function": {"name": "get_weather", "arguments": '{"city": "Rome"}'}})
+    _check("tool call payload: arguments echoed as the SAME string",
+           _call_payload["tool_calls"][1]["function"]["arguments"] == '{"city": "Paris"}')
+    _result_payload = tconv.get_ith_message(3).get_message_payload()
+    _check("tool result payload: role tool, id, string content",
+           _result_payload == {"role": rc.ROLE_TOOL, "tool_call_id": "call_1", "content": "18C, clear"})
+    _check("tool result payload: an empty result is an empty string, not null",
+           tconv.get_ith_message(4).get_message_payload()["content"] == "")
+    _spoken = AIMessage(rc.ROLE_ASSISTANT, "let me check", rc.AIC_TYPE_TOOL_CALL, tool_calls=_A_CALL)
+    _check("tool call payload: prose alongside the calls is a string", _spoken.get_message_payload()["content"] == "let me check")
+
+    #arguments: a dict passed by a caller building a call by hand is serialised ONCE, on the way in
+    _by_hand = AIMessage(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL,
+                         tool_calls=[{"id": "h", "name": "f", "arguments": {"a": 1}}])
+    _check("dict arguments are stored as a JSON string", _by_hand.get_tool_calls()[0]["arguments"] == '{"a": 1}')
+    _check("a call with no arguments key gets an empty string",
+           AIMessage(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL,
+                     tool_calls=[{"id": "h", "name": "f"}]).get_tool_calls()[0]["arguments"] == "")
+
+    #the caller's list is copied, never aliased: editing it afterwards must not rewrite the record
+    _mine = [{"id": "z", "name": "f", "arguments": "{}"}]
+    _kept = AIMessage(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=_mine)
+    _mine[0]["name"] = "changed"
+    _check("the stored calls are a copy of the caller's list", _kept.get_tool_calls()[0]["name"] == "f")
+
+    #editing the text of a tool message must keep its calls / its id
+    _edit = tconv.get_ith_message(2)
+    _edit.set_text("thinking aloud")
+    _check("set_text() on a tool call keeps the calls", len(_edit.get_tool_calls()) == 2 and _edit.get_text() == "thinking aloud")
+    _edit_r = tconv.get_ith_message(3)
+    _edit_r.set_text("18C")
+    _check("set_text() on a tool result keeps the id and name",
+           _edit_r.get_tool_call_id() == "call_1" and _edit_r.get_tool_name() == "get_weather")
+
+    #the record survives a round trip through disk, and a file with no tool traffic is unchanged
+    _tool_path = os.path.join(tempfile.gettempdir(), "aiconversation_tools_test.jsonl")
+    tconv.save_conversation(_tool_path)
+    _back = AIConversation.from_file(_tool_path)
+    os.remove(_tool_path)
+    _check("tool messages survive save/load",
+           [m.to_dict() for m in _back.get_history_messages()] == [m.to_dict() for m in tconv.get_history_messages()])
+    _check("...calls intact", _back.get_ith_message(2).get_tool_calls() == tconv.get_ith_message(2).get_tool_calls())
+    _check("...id and name intact",
+           _back.get_ith_message(3).get_tool_call_id() == "call_1" and _back.get_ith_message(3).get_tool_name() == "get_weather")
+    _check("...and still out of memory after the reload",
+           rc.AIC_TYPE_TOOL_CALL not in {m.get_type() for m in _back.get_memory_messages()})
+    _check("a message with no tool traffic writes no tool keys",
+           not ({"tool_calls", "tool_call_id", "tool_name"} & set(tconv.get_ith_message(1).to_dict())))
+    _check("a pre-tools file (no tool keys) still loads",
+           AIMessage.from_dict({"role": rc.ROLE_USER, "msg_type": rc.AIC_TYPE_TEXT, "content_text": "old"}).get_text() == "old")
+
+    _check("count_memory_types() reports no tool traffic",
+           not (rc.AIC_TOOL_TYPES & set(tconv.count_memory_types())))
+    print("  history with a tool turn, as print() shows it:")
+    tconv.print()
 
 
     # ---------------------------------------------------------------- sticky messages
