@@ -80,6 +80,12 @@ conv.get_memory_messages_for_ai()    # plain dicts, memory window   <-- the usua
 
 The `_for_ai` pair returns the `messages` array and nothing else — no model, no sampling settings.
 
+Printed message numbers always refer to their positions in the full history. Memory and filtered
+history views can leave gaps, so the displayed number identifies the same message for
+`get_ith_message(n)`, `remove_nth_message(n)` and stickiness changes. After deletion, numbers follow
+the updated history positions. `print_specific_message(n)` is an alias for `print_message_No(n)`;
+both accept negative indices and display the corresponding nonnegative history number.
+
 ### Controlling memory
 
 ```python
@@ -91,11 +97,14 @@ conv.restart()                            # drop all messages except the system 
 
 ### `/NEWTOPIC` — restart memory without losing history
 
-`conv.new_topic()` appends an internal `/NEWTOPIC` marker to the history. It is the **only** internal
+`conv.new_topic()` appends a `newtopic` marker with role `internal` and text `/NEWTOPIC` to the history. It is the **only** internal
 message the class interprets: when memory is built, the class walks the history backwards from the
 most recent message and **stops at the first `/NEWTOPIC` it meets**. Everything before the marker is
 invisible to the model — including sticky messages — as if the conversation had just begun. Only
 the system prompt is carried across.
+
+Legacy markers stored as type `internal` with text `/NEWTOPIC` still work. Loading a saved conversation
+upgrades those markers to `newtopic` and moves legacy internal reasoning records to role `assistant`.
 
 ```
 history:  [system] [u1] [a1] [u2*] [a2] [/NEWTOPIC] [u3] [a3]        (* = sticky)
@@ -152,7 +161,7 @@ The rules:
 ## Message types
 
 `AIC_TYPE_TEXT`, `AIC_TYPE_IMAGE_URL`, `AIC_TYPE_FILE`, `AIC_TYPE_INTERNAL`, `AIC_TYPE_REASONING`,
-`AIC_TYPE_TOOL_CALL`, `AIC_TYPE_TOOL_RESULT`.
+`AIC_TYPE_WARNING`, `AIC_TYPE_NEWTOPIC`, `AIC_TYPE_AGENT`, `AIC_TYPE_TOOL_CALL`, `AIC_TYPE_TOOL_RESULT`.
 
 ```python
 conv.add_message(rc.ROLE_USER, "What is in this picture?",
@@ -162,22 +171,37 @@ conv.add_message(rc.ROLE_USER, "What is in this picture?",
 Images and files may be an http URL, a `data:` URL, or a **local path** — a local path is read and
 base64 encoded on the spot, and the stored url becomes the data URL.
 
+File attachments accept an optional filename. Local paths supply their basename automatically;
+URLs and data URLs can supply it explicitly. The name survives `set_text()` and save/load, and appears
+as `filename` inside the `file_url` content block. Unnamed attachments keep their existing format.
+
+```python
+conv.add_message(rc.ROLE_USER, "Summarise this", rc.AIC_TYPE_FILE,
+                 file_url="c:/docs/report.pdf", file_name="report.pdf")
+conv.get_ith_message(-1).get_file_name()
+conv.add_message(rc.ROLE_INTERNAL, "Attachment unavailable", rc.AIC_TYPE_WARNING)
+conv.add_message(rc.ROLE_ASSISTANT, "Recorded agent output", rc.AIC_TYPE_AGENT)
+```
+
+Warnings and agent records remain in history, cost zero estimated tokens, and never enter AI-facing
+history or memory, even when sticky or when `add_reasoning=True`.
+
 ### Which type each role may carry
 
 Not every role accepts every type. The contract is declared once in
 `rom_const.AIC_ALLOWED_TYPES_BY_ROLE` and enforced by the `AIMessage` constructor (on construction
 **and** on load), which raises `ValueError` on any pair outside the table:
 
-| role | text | image_url | file | internal | reasoning | tool_call | tool_result |
-|-------------|:----:|:---------:|:----:|:--------:|:---------:|:---------:|:-----------:|
-| `system`    |  ✅  |           |      |          |           |           |             |
-| `developer` |  ✅  |           |      |          |           |           |             |
-| `user`      |  ✅  |    ✅     |  ✅  |          |           |           |             |
-| `assistant` |  ✅  |    ✅     |  ✅  |          |    ✅     |    ✅     |             |
-| `tool`      |      |           |      |          |           |           |     ✅      |
-| `internal`  |      |           |      |    ✅    |           |           |             |
+| role | text | image_url | file | internal | reasoning | warning | newtopic | agent | tool_call | tool_result |
+|-------------|:----:|:---------:|:----:|:--------:|:---------:|:-------:|:--------:|:-----:|:---------:|:-----------:|
+| `system`    | ✅ | | | | | | | | | |
+| `developer` | ✅ | | | | | | | | | |
+| `user`      | ✅ | ✅ | ✅ | | | | | | | |
+| `assistant` | ✅ | ✅ | ✅ | | ✅ | | | ✅ | ✅ | |
+| `tool`      | | | | | | | | | | ✅ |
+| `internal`  | | | | ✅ | | ✅ | ✅ | | | |
 
-So an **internal** message carries only its command text — never an image — **reasoning** and a
+So an **internal** message carries commands, warnings and topic markers — never an image — **reasoning** and a
 **tool call** are assistant-only kinds of output, and a **tool** says exactly one thing: its result.
 To change the policy, edit the table; the errors and this behaviour follow automatically.
 
@@ -313,7 +337,7 @@ The exit code of the test runs is 0 when every check passes, non-zero otherwise.
 ## Known limitations
 
 - Image token estimates use byte size rather than pixel dimensions (see above).
-- `AIMessage.is_internal()` reports the *type* (it is `True` for both `internal` and `reasoning`),
+- `AIMessage.is_internal()` reports the *type* (it is `True` for `internal`, `warning`, `newtopic`, `reasoning` and `agent`),
   but memory filtering does not use it: `get_memory_messages()` excludes reasoning by its **type**,
   so a reasoning message stays out of memory by default even though its role is `assistant`. Pass
   `add_reasoning=True` to feed it back to the model.

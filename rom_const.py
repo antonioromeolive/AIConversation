@@ -22,6 +22,9 @@ AIC_TYPE_IMAGE_URL   = "image_url"
 AIC_TYPE_FILE        = "file"
 AIC_TYPE_INTERNAL    = "internal" #used to send "commands" to the system
 AIC_TYPE_REASONING   = "reasoning" #used to store reasoning steps (when part of the model output). Not sent to the model as part of the conversation memory
+AIC_TYPE_WARNING     = "warning"   #application warning, recorded under ROLE_INTERNAL
+AIC_TYPE_NEWTOPIC    = "newtopic"  #explicit topic boundary, recorded under ROLE_INTERNAL
+AIC_TYPE_AGENT       = "agent"     #recorded agent output under ROLE_ASSISTANT, never sent in memory
 AIC_TYPE_TOOL_CALL   = "tool_call"   #the assistant asked for one or more tools to be run. RECORD ONLY: kept in the history, never sent back as part of memory
 AIC_TYPE_TOOL_RESULT = "tool_result" #what one tool returned, answering one tool_call_id. RECORD ONLY, like AIC_TYPE_TOOL_CALL
 
@@ -31,27 +34,29 @@ AIC_TYPE_TOOL_RESULT = "tool_result" #what one tool returned, answering one tool
 #  - system / developer : text only (a system prompt is text)
 #  - user               : text, plus image or file attachments
 #  - assistant          : text and reasoning (model output), images/files it may return, and
-#                         tool calls (a request to run tools, also model output)
+#                         tool calls (a request to run tools, also model output), and agent records
 #  - tool               : a tool result only - the one thing a tool ever says
-#  - internal           : its command text only - never an image, never conversation content
+#  - internal           : commands, warnings and topic boundaries - never attachments
 #A role absent from this table is not a valid message role.
 AIC_ALLOWED_TYPES_BY_ROLE = {
     ROLE_SYSTEM:    {AIC_TYPE_TEXT},
     ROLE_DEVELOPER: {AIC_TYPE_TEXT},
     ROLE_USER:      {AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE},
-    ROLE_ASSISTANT: {AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE, AIC_TYPE_REASONING, AIC_TYPE_TOOL_CALL},
+    ROLE_ASSISTANT: {AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE, AIC_TYPE_REASONING, AIC_TYPE_TOOL_CALL, AIC_TYPE_AGENT},
     ROLE_TOOL:      {AIC_TYPE_TOOL_RESULT},
-    ROLE_INTERNAL:  {AIC_TYPE_INTERNAL},
+    ROLE_INTERNAL:  {AIC_TYPE_INTERNAL, AIC_TYPE_WARNING, AIC_TYPE_NEWTOPIC},
 }
 
 #the content types that are RECORDED but never SENT: they live in the history, cost 0 tokens
 #(the token estimate is "what will the next request cost", and these are never in it) and are
 #left out of memory by get_memory_messages(). INTERNAL is here unconditionally; REASONING can be
-#let back in with add_reasoning=True; the two TOOL types cannot be let back in at all, see
+#let back in with add_reasoning=True; warnings, topic markers, agent records and the two TOOL types
+#cannot be let back in at all, see
 #AIConversation.__may_enter_memory() for why.
 AIC_TOOL_TYPES = {AIC_TYPE_TOOL_CALL, AIC_TYPE_TOOL_RESULT}
 
-#the ONE internal marker this class interprets: get_memory_messages() stops at the most recent one.
+#the text of a topic marker: get_memory_messages() stops at the most recent AIC_TYPE_NEWTOPIC
+#or legacy internal message with this text.
 #Any other text passed to add_comment() ("/MODEL:gpt-4o", "user changed provider", ...) is an
 #application-defined note: stored verbatim in the history, never parsed, never sent to a model.
 AIC_COMMAND_NEWTOPIC         = "/NEWTOPIC"

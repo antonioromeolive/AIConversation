@@ -12,12 +12,15 @@
 # MIT License (see the LICENSE file distributed with this project)
 
 import json
+import io
 import os
+import re
 import tempfile
+from contextlib import ExitStack, redirect_stdout
 
 import rom_const as rc
 from rom_printing_utils import printColor, printColorSameLine
-from AIConversation import AIMessage, AIConversation
+from AIConversation import AIMessageContent, AIMessage, AIConversation
 
 
 def run_tests() -> bool:
@@ -74,6 +77,7 @@ def run_tests() -> bool:
     #otherwise a missing-content failure would masquerade as a contract failure.
     _ALL_TYPES = [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE,
                   rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING,
+                  rc.AIC_TYPE_WARNING, rc.AIC_TYPE_NEWTOPIC, rc.AIC_TYPE_AGENT,
                   rc.AIC_TYPE_TOOL_CALL, rc.AIC_TYPE_TOOL_RESULT]
     _ALL_ROLES = [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER, rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_TOOL, rc.ROLE_INTERNAL]
     _A_CALL    = [{"id": "call_t", "name": "probe", "arguments": "{}"}]   #the minimal legal tool call
@@ -160,7 +164,7 @@ def run_tests() -> bool:
 
     _section("2b. Every wrong (role, type) message is refused")
 
-    #Sweep the ENTIRE 6x7 grid against the declared contract. For each pair, supply the content that
+    #Sweep every role/type pair against the declared contract. For each pair, supply the content that
     #type needs, so the only thing under test is whether the pair itself is allowed. The table is the
     #oracle: this proves the constructor actually consults it, in every cell, not just the few probed
     #by hand above. A regression that dropped the pair check would light up here as accepted-when-it-
@@ -214,6 +218,9 @@ def run_tests() -> bool:
     _check("file with no url refused",          not _accepts(rc.ROLE_USER, "cap", rc.AIC_TYPE_FILE))
     _check("internal with no command refused",  not _accepts(rc.ROLE_INTERNAL, "", rc.AIC_TYPE_INTERNAL))
     _check("reasoning with no text refused",    not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_REASONING))
+    _check("warning with no text refused",      not _accepts(rc.ROLE_INTERNAL, "", rc.AIC_TYPE_WARNING))
+    _check("topic marker with no text refused", not _accepts(rc.ROLE_INTERNAL, "", rc.AIC_TYPE_NEWTOPIC))
+    _check("agent record with no text refused", not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_AGENT))
     _check("tool call with no calls refused",   not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=[]))
     _check("tool call missing an id refused",   not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=[{"name": "f"}]))
     _check("tool call missing a name refused",  not _accepts(rc.ROLE_ASSISTANT, "", rc.AIC_TYPE_TOOL_CALL, tool_calls=[{"id": "x"}]))
@@ -1005,6 +1012,147 @@ def run_tests() -> bool:
     _section("12. Deprecated entry point")
     conv.print()
 
+
+    # ---------------------------------------------------------------- additions from the CHAT version
+    _section("13. Filenames, recorded message types, legacy loading and history indices")
+
+    with ExitStack() as temp_files:
+        def _temporary_file(suffix:str) -> str:
+            descriptor, path = tempfile.mkstemp(suffix=suffix)
+            os.close(descriptor)
+            temp_files.callback(lambda: os.path.exists(path) and os.remove(path))
+            return path
+
+        attachment_path = _temporary_file(".txt")
+        attachment_name = os.path.basename(attachment_path)
+        with open(attachment_path, "w", encoding="utf-8") as handle:
+            handle.write("attachment contents")
+        attachments = AIConversation("prompt")
+        attachments.add_message(rc.ROLE_USER, "caption", rc.AIC_TYPE_FILE, file_url=attachment_path)
+        file_message = attachments.get_ith_message(1)
+        os.remove(attachment_path)
+        file_message.set_text("edited caption")
+        attachments.recalculate_tokens()
+        _check("local filename survives encoding and editing after the original file is removed",
+               file_message.get_file_name() == attachment_name and
+               file_message.get_message_payload()["content"][0]["file_url"] == {
+                   "url": "data:text/plain;base64,YXR0YWNobWVudCBjb250ZW50cw==", "filename": attachment_name})
+        attachments.add_message(rc.ROLE_USER, "named", rc.AIC_TYPE_FILE,
+                                file_url=DEMO_FILE, file_name="explicit.txt")
+        attachments.add_message(rc.ROLE_USER, "unnamed", rc.AIC_TYPE_FILE, file_url=DEMO_FILE)
+        saved_path = _temporary_file(".jsonl")
+        attachments.save_conversation(saved_path)
+        attachment_reload = AIConversation.from_file(saved_path)
+        _check("filenames and payloads survive file save/load",
+               [m.to_dict() for m in attachment_reload.get_history_messages()] ==
+               [m.to_dict() for m in attachments.get_history_messages()] and
+               attachment_reload.get_ith_message(2).get_message_payload()["content"][0]["file_url"]["filename"] == "explicit.txt")
+        _check("unnamed attachments keep their existing serialized and payload shapes",
+               "content_file_name" not in attachment_reload.get_ith_message(3).to_dict() and
+               attachment_reload.get_ith_message(3).get_message_payload()["content"][0]["file_url"] == {"url": DEMO_FILE})
+        content_reload = AIMessageContent.from_dict(file_message.get_content().to_dict())
+        _check("content serialization also preserves the filename",
+               content_reload.get_file_name() == attachment_name and
+               content_reload.get_content() == file_message.get_content().get_content())
+        overridden = AIMessage(rc.ROLE_USER, "caption", rc.AIC_TYPE_FILE,
+                               content_file_url="https://example.com/file.txt", content_file_name="override.txt")
+        _check("remote attachments accept explicit filenames",
+               overridden.get_message_payload()["content"][0]["file_url"] == {
+                   "url": "https://example.com/file.txt", "filename": "override.txt"})
+
+        legacy_path = _temporary_file(".jsonl")
+        legacy_rows = [
+            {"role": rc.ROLE_SYSTEM, "content_text": "legacy prompt"},
+            {"role": rc.ROLE_USER, "content_text": "earlier topic", "sticky": True},
+            {"role": rc.ROLE_INTERNAL, "msg_type": rc.AIC_TYPE_REASONING, "content_text": "older reasoning"},
+            {"role": rc.ROLE_INTERNAL, "msg_type": rc.AIC_TYPE_INTERNAL, "content_text": " /newtopic "},
+            {"role": rc.ROLE_ASSISTANT, "msg_type": rc.AIC_TYPE_TOOL_CALL, "content_text": "",
+             "tool_calls": [{"id": "legacy_call", "name": "probe", "arguments": '{ "x": 1 }'}]},
+            {"role": rc.ROLE_TOOL, "msg_type": rc.AIC_TYPE_TOOL_RESULT, "content_text": "result",
+             "tool_call_id": "legacy_call", "tool_name": "probe"},
+            {"role": rc.ROLE_USER, "content_text": "current topic"},
+        ]
+        with open(legacy_path, "w", encoding="utf-8") as handle:
+            for row in legacy_rows:
+                handle.write(json.dumps(row) + "\n")
+        migrated = AIConversation.from_file(legacy_path)
+        _check("legacy reasoning is recovered under the assistant role",
+               migrated.get_ith_message(2).get_role() == rc.ROLE_ASSISTANT and
+               migrated.get_ith_message(2).get_type() == rc.AIC_TYPE_REASONING)
+        _check("legacy topic markers still exclude earlier sticky messages after loading",
+               migrated.get_ith_message(3).get_type() == rc.AIC_TYPE_NEWTOPIC and
+               [m.get_text() for m in migrated.get_memory_messages()] == ["legacy prompt", "current topic"])
+        _check("legacy loading preserves tool ids and the exact argument string",
+               migrated.get_ith_message(4).get_tool_calls()[0]["arguments"] == '{ "x": 1 }' and
+               migrated.get_ith_message(5).get_tool_call_id() == "legacy_call")
+        migrated.save_conversation(legacy_path)
+        migrated_again = AIConversation.from_file(legacy_path)
+        _check("saving a migrated conversation makes further loading stable",
+               migrated_again.to_dict() == migrated.to_dict())
+
+    numbered = AIConversation("prompt", max_memory=2)
+    numbered.add_message(rc.ROLE_USER, "pinned", is_sticky=True)                      #1
+    numbered.add_comment("note")                                                    #2
+    numbered.add_message(rc.ROLE_ASSISTANT, "old reply")                             #3
+    numbered.add_message(rc.ROLE_USER, "recent question")                            #4
+    numbered.add_message(rc.ROLE_ASSISTANT, "reasoning", rc.AIC_TYPE_REASONING)       #5
+    numbered.add_tool_call(_A_CALL)                                                  #6
+    numbered.add_tool_result("call_t", "result")                                     #7
+    numbered.add_message(rc.ROLE_ASSISTANT, "recent reply")                          #8
+    tokens_before_records = numbered.get_total_tokens()
+    numbered.add_message(rc.ROLE_INTERNAL, "warning", rc.AIC_TYPE_WARNING, is_sticky=True)  #9
+    numbered.add_message(rc.ROLE_ASSISTANT, "agent record", rc.AIC_TYPE_AGENT, is_sticky=True) #10
+    _check("warnings and agent records do not consume memory slots or tokens, even when sticky",
+           [m.get_text() for m in numbered.get_memory_messages()] ==
+           ["prompt", "pinned", "recent question", "recent reply"] and
+           numbered.get_total_tokens() == tokens_before_records)
+    _check("warnings and agent records never enter either AI-facing view",
+           all(p["content"][0]["type"] not in (rc.AIC_TYPE_WARNING, rc.AIC_TYPE_AGENT)
+               for p in numbered.get_history_messages_for_ai(add_reasoning=True)) and
+           all(m.get_type() not in (rc.AIC_TYPE_WARNING, rc.AIC_TYPE_AGENT)
+               for m in numbered.get_memory_messages(add_reasoning=True)))
+
+    def _printed_indices(conversation:AIConversation, **kwargs) -> list[int]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            count = conversation.print(**kwargs)
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+        indices = [int(n) for n in re.findall(r"^(\d+)\. ", plain, re.MULTILINE)]
+        _check("printed count matches the displayed messages", count == len(indices))
+        return indices
+
+    _check("filtered history retains full-history indices",
+           _printed_indices(numbered) == [0, 1, 3, 4, 5, 6, 7, 8, 10])
+    _check("memory retains full-history indices across sticky and excluded messages",
+           _printed_indices(numbered, memory_only=True) == [0, 1, 4, 8])
+    _check("unfiltered history includes every index",
+           _printed_indices(numbered, add_internal=True) == list(range(11)))
+    numbered.new_topic()                                                             #11
+    _check("new_topic creates a dedicated marker", numbered.get_ith_message(11).get_type() == rc.AIC_TYPE_NEWTOPIC)
+    numbered.add_message(rc.ROLE_USER, "new question")                               #12
+    numbered.add_comment("new note")                                                 #13
+    numbered.add_message(rc.ROLE_ASSISTANT, "new answer")                             #14
+    _check("memory keeps history indices after a topic boundary",
+           _printed_indices(numbered, memory_only=True) == [0, 12, 14])
+    _check("deleting by the displayed memory number removes the intended message",
+           numbered.remove_nth_message(12) and
+           "new question" not in [m.get_text() for m in numbered.get_history_messages()] and
+           numbered.get_ith_message(13).get_text() == "new answer")
+    _check("displayed indices follow the new history positions after deletion",
+           _printed_indices(numbered, memory_only=True) == [0, 13])
+    alias_output = io.StringIO()
+    with redirect_stdout(alias_output):
+        alias_ok = numbered.print_specific_message(-1)
+    _check("print_specific_message preserves negative-index access and displays the history number",
+           alias_ok and "13 ------------------------------------------" in alias_output.getvalue())
+    numbered.add_comment(rc.AIC_COMMAND_NEWTOPIC)
+    numbered.add_message(rc.ROLE_USER, "after old marker")
+    _check("old-style topic markers still work in live conversations",
+           [m.get_text() for m in numbered.get_memory_messages()] == ["prompt", "after old marker"])
+    numbered.add_message(rc.ROLE_INTERNAL, "custom boundary", rc.AIC_TYPE_NEWTOPIC)
+    numbered.add_message(rc.ROLE_ASSISTANT, "after typed marker")
+    _check("dedicated topic markers work regardless of their text",
+           [m.get_text() for m in numbered.get_memory_messages()] == ["prompt", "after typed marker"])
 
     # ---------------------------------------------------------------- verdict
     _section("Result")

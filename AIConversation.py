@@ -41,7 +41,7 @@ from rom_printing_utils import printColor, printColorSameLine
 class AIMessageContent:
     """ The content of a single message, in two representations at once:
 
-        - the SEMANTIC fields (type, text, image_url, file_url), which are what gets persisted, and
+        - the SEMANTIC fields (type, text, image_url, file_url, file_name), which get persisted, and
         - the CONTENT BLOCKS (get_content()), the list of {"type": ...} entries an AI endpoint
           expects inside a message.
 
@@ -51,13 +51,15 @@ class AIMessageContent:
         endpoint's request format: only this class knows the block layout.
 
         Supported types (rom_const): AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE,
-        AIC_TYPE_INTERNAL, AIC_TYPE_REASONING, AIC_TYPE_TOOL_CALL and AIC_TYPE_TOOL_RESULT.
+        AIC_TYPE_INTERNAL, AIC_TYPE_REASONING, AIC_TYPE_WARNING, AIC_TYPE_NEWTOPIC,
+        AIC_TYPE_AGENT, AIC_TYPE_TOOL_CALL and AIC_TYPE_TOOL_RESULT.
 
         Images and files may be given as an http URL, as a "data:" URL, or as a local path: a local
         path is READ AND BASE64 ENCODED at construction, and the stored url becomes the data URL.
         The original path is not kept.
 
-        The tool fields are keyword-only, so the four positional parameters above keep their
+        The optional file name follows the original four positional parameters. Tool fields are
+        keyword-only, so the original positional parameters keep their
         meaning for every caller written before tools existed:
           - tool_calls   (AIC_TYPE_TOOL_CALL)   a list of {"id", "name", "arguments"} dicts.
                          `arguments` is the JSON STRING exactly as the endpoint sent it: it must be
@@ -65,17 +67,18 @@ class AIMessageContent:
           - tool_call_id (AIC_TYPE_TOOL_RESULT) the id of the call this result answers.
           - tool_name    (AIC_TYPE_TOOL_RESULT) the tool that produced it. Optional, for display.
     """
-    def __init__(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "",
+    def __init__(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "", msg_file_name: "str | None" = None,
                  *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         self.__content:  list[dict[str, Any]] = []
         self.__type: str = msg_type
         self.__image_url: "str | None" = msg_image_url
         self.__file_url: "str | None" = msg_file_url
+        self.__file_name: "str | None" = msg_file_name
         self.__text: str = msg_text
         self.__tool_calls: list[dict[str, Any]] = []
         self.__tool_call_id: str = ""
         self.__tool_name: str = ""
-        self.set_content(msg_type, msg_image_url, msg_text, msg_file_url,
+        self.set_content(msg_type, msg_image_url, msg_text, msg_file_url, msg_file_name,
                          tool_calls=tool_calls, tool_call_id=tool_call_id, tool_name=tool_name)
 
 
@@ -92,11 +95,13 @@ class AIMessageContent:
             'tool_call_id': self.__tool_call_id,
             'tool_name': self.__tool_name
         }
+        if self.__file_name:
+            my_dict_version['file_name'] = self.__file_name
         return my_dict_version
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d['type'], d.get('image_url', ''), d.get('text', ''), d.get('file_url', ''),
+        return cls(d['type'], d.get('image_url', ''), d.get('text', ''), d.get('file_url', ''), d.get('file_name'),
                    tool_calls=d.get('tool_calls'), tool_call_id=d.get('tool_call_id', ''), tool_name=d.get('tool_name', ''))
 
     def get_type(self) -> str:
@@ -107,6 +112,9 @@ class AIMessageContent:
 
     def get_file_url(self) -> "str | None":
         return self.__file_url
+
+    def get_file_name(self) -> "str | None":
+        return self.__file_name
 
     def get_text(self) -> str:
         return self.__text
@@ -127,7 +135,7 @@ class AIMessageContent:
     def get_content(self) -> list[dict[str, Any]]:
         return self.__content
 
-    def set_content(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "",
+    def set_content(self, msg_type: str, msg_image_url: "str | None" = "", msg_text: str = "", msg_file_url: "str | None" = "", msg_file_name: "str | None" = None,
                     *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         """ Replace the content and rebuild the content blocks returned by get_content().
 
@@ -147,6 +155,7 @@ class AIMessageContent:
         self.__type: str = msg_type
         self.__image_url: "str | None" = msg_image_url
         self.__file_url: "str | None" = msg_file_url
+        self.__file_name: "str | None" = msg_file_name
         self.__text: str = msg_text
         #a defensive copy of every call: the caller's list may be the one it is still appending
         #results to, and a saved conversation must not change because a caller edited its dict later
@@ -239,6 +248,7 @@ class AIMessageContent:
                         encoded_file: str = base64.b64encode(file_obj.read()).decode("utf-8")
                     data_url = f"data:{mime_type};base64,{encoded_file}"
                     self.__file_url = data_url
+                    self.__file_name = msg_file_name or os.path.basename(msg_file_url)
                     self.__content = [
                         {
                             "type": rc.AIC_TYPE_FILE,
@@ -265,7 +275,10 @@ class AIMessageContent:
                             "text": msg_text
                         }
                     ]
-        elif msg_type == rc.AIC_TYPE_INTERNAL or msg_type == rc.AIC_TYPE_REASONING: #store a command, internal message... will be not sent to AI
+            if self.__file_name:
+                self.__content[0]['file_url']['filename'] = self.__file_name
+        elif msg_type in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING, rc.AIC_TYPE_WARNING,
+                          rc.AIC_TYPE_NEWTOPIC, rc.AIC_TYPE_AGENT):
             self.__content = [
                 {
                     "type": msg_type,
@@ -311,9 +324,8 @@ class AIMessageContent:
             result = f"File  URL: {self.__file_url}\nText: {self.__text}"
         elif self.__type == rc.AIC_TYPE_TEXT:
             result = f"Text: {self.__text}"
-        elif self.__type == rc.AIC_TYPE_INTERNAL:
-            result = f"Text: {self.__text}"
-        elif self.__type == rc.AIC_TYPE_REASONING:
+        elif self.__type in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING, rc.AIC_TYPE_WARNING,
+                             rc.AIC_TYPE_NEWTOPIC, rc.AIC_TYPE_AGENT):
             result = f"Text: {self.__text}"
         elif self.__type == rc.AIC_TYPE_TOOL_CALL:
             calls = "\n".join(f"  -> {call['name']}({call.get('arguments', '')}) [{call['id']}]" for call in self.__tool_calls)
@@ -335,7 +347,7 @@ class AIMessage:
         message so a reader can tell who said what. It is never sent as a request parameter - the
         calling program supplies the target model when it builds the request.
     """
-    def __init__(self, role: str, content_text:str, msg_type:str, content_image_url:"str | None" = None, sticky:bool = False, content_file_url:"str | None" = None, model:str = "",
+    def __init__(self, role: str, content_text:str, msg_type:str, content_image_url:"str | None" = None, sticky:bool = False, content_file_url:"str | None" = None, model:str = "", content_file_name:"str | None" = None,
                  *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         """ Build a message. Every type validates its own required content.
 
@@ -346,20 +358,22 @@ class AIMessage:
                 types, where it may be empty too (a model often calls a tool and says nothing, and a
                 tool may legitimately return nothing).
             msg_type: one of AIC_TYPE_TEXT, AIC_TYPE_IMAGE_URL, AIC_TYPE_FILE, AIC_TYPE_INTERNAL,
-                AIC_TYPE_REASONING, AIC_TYPE_TOOL_CALL, AIC_TYPE_TOOL_RESULT - but only if the role
+                AIC_TYPE_REASONING, AIC_TYPE_WARNING, AIC_TYPE_NEWTOPIC, AIC_TYPE_AGENT,
+                AIC_TYPE_TOOL_CALL, AIC_TYPE_TOOL_RESULT - but only if the role
                 is allowed to carry it, see below.
             content_image_url: required for AIC_TYPE_IMAGE_URL. http URL, "data:" URL or local path.
             sticky: sticky messages survive the memory window, see set_sticky().
             content_file_url: required for AIC_TYPE_FILE. Same accepted forms as the image url.
             model: provenance, the model that produced or received this message. Optional.
+            content_file_name: optional attachment filename, derived from local paths when omitted.
             tool_calls: required for AIC_TYPE_TOOL_CALL. See AIMessageContent.
             tool_call_id: required for AIC_TYPE_TOOL_RESULT. See AIMessageContent.
             tool_name: optional for AIC_TYPE_TOOL_RESULT.
 
         The (role, type) contract is declared once in rc.AIC_ALLOWED_TYPES_BY_ROLE and enforced here:
         system/developer carry text only, user carries text/image/file, assistant carries those plus
-        reasoning and tool calls, tool carries only a tool result, and internal carries only its
-        command text. An internal message therefore cannot hold an image, and reasoning is an
+        reasoning, tool calls and agent records, tool carries only a tool result, and internal carries
+        commands, warnings and topic markers. An internal message cannot hold an image, and reasoning is an
         assistant-only kind of output.
 
         Raises:
@@ -367,8 +381,8 @@ class AIMessage:
                 (role, type) pair the contract forbids (e.g. an image on an internal message).
 
         Notes:
-            - Token estimates are computed here and refreshed by set_text(). AIC_TYPE_INTERNAL,
-              AIC_TYPE_REASONING and the tool types cost 0: see __refresh_estimated_tokens().
+            - Token estimates are computed here and refreshed by set_text(). Internal records,
+              reasoning, agent records and tool types cost 0: see __refresh_estimated_tokens().
             - set_text() changes the text in place; set_content() replaces the whole content and
               expects an AIMessageContent object.
         """
@@ -399,6 +413,7 @@ class AIMessage:
             raise ValueError(f"AIMessage.__init__ - Invalid message role: {role!r}")
 
         if (msg_type not in [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE, rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING,
+                             rc.AIC_TYPE_WARNING, rc.AIC_TYPE_NEWTOPIC, rc.AIC_TYPE_AGENT,
                              rc.AIC_TYPE_TOOL_CALL, rc.AIC_TYPE_TOOL_RESULT]):
             raise ValueError(f"AIMessage.__init__ - Invalid message type: {msg_type!r}")
 
@@ -412,15 +427,15 @@ class AIMessage:
             else:
                 self.__content = AIMessageContent(rc.AIC_TYPE_IMAGE_URL, content_image_url, content_text)
                 self.__image_tokens = self.num_tokens_from_picture(content_image_url)
-        elif (msg_type == rc.AIC_TYPE_INTERNAL):
+        elif msg_type in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_WARNING, rc.AIC_TYPE_NEWTOPIC):
             if content_text is None or content_text == "":
                 raise ValueError("Missing TEXT for " + msg_type + " message")
             self.__content = AIMessageContent(msg_type, None, content_text)
             self.__is_internal = True
-        elif (msg_type == rc.AIC_TYPE_REASONING):
+        elif msg_type in (rc.AIC_TYPE_REASONING, rc.AIC_TYPE_AGENT):
             if content_text is None or content_text == "":
                 raise ValueError("Missing TEXT for " + msg_type + " message")
-            self.__content = AIMessageContent(rc.AIC_TYPE_REASONING, None, content_text)
+            self.__content = AIMessageContent(msg_type, None, content_text)
             self.__is_internal = True
         elif (msg_type == rc.AIC_TYPE_TEXT):
             if content_text is None or content_text == "":
@@ -429,7 +444,8 @@ class AIMessage:
         elif (msg_type == rc.AIC_TYPE_FILE):
             if content_file_url is None or content_file_url == "":
                 raise ValueError("Missing File URL for " + msg_type + " message")
-            self.__content = AIMessageContent(rc.AIC_TYPE_FILE, msg_file_url=content_file_url, msg_text=content_text)
+            self.__content = AIMessageContent(rc.AIC_TYPE_FILE, msg_file_url=content_file_url, msg_text=content_text,
+                                              msg_file_name=content_file_name)
         elif (msg_type == rc.AIC_TYPE_TOOL_CALL):
             #the text is optional here; the calls are not, and AIMessageContent checks them
             self.__content = AIMessageContent(rc.AIC_TYPE_TOOL_CALL, None, content_text, tool_calls=tool_calls)
@@ -449,7 +465,7 @@ class AIMessage:
             REQUEST - "what is this conversation going to cost me to send" - not a record of what
             has already been spent. That one choice decides the rules:
 
-            - INTERNAL costs 0: never sent to anything, by anyone.
+            - INTERNAL, WARNING, NEWTOPIC and AGENT cost 0: never part of AI memory.
             - REASONING and the two TOOL types cost 0, and that is NOT a claim that they were free.
               Reasoning was billed, as output tokens, when the model generated it; tool traffic was
               sent and billed by the caller during the tool loop. But none of them is ever part of
@@ -463,7 +479,8 @@ class AIMessage:
             estimate of an image message just because its text was edited (a local file path gets
             normalised into a much longer base64 data URL by AIMessageContent).
         """
-        if self.__content.get_type() in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING) or self.__content.get_type() in rc.AIC_TOOL_TYPES:
+        if self.__content.get_type() in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING, rc.AIC_TYPE_WARNING,
+                                        rc.AIC_TYPE_NEWTOPIC, rc.AIC_TYPE_AGENT) or self.__content.get_type() in rc.AIC_TOOL_TYPES:
             self.__estimated_tokens = 0     #not sent to AI as part of memory, so no token no cry
         else:
             self.__estimated_tokens = self.__image_tokens + self.num_tokens_from_string(self.__content.get_text())
@@ -534,6 +551,8 @@ class AIMessage:
         }
         #the tool fields are written only when they carry something, so a file holding no tool
         #traffic looks exactly as it did before tools existed
+        if self.__content.get_file_name():
+            my_dict_version['content_file_name'] = self.__content.get_file_name()
         if self.__content.get_tool_calls():
             my_dict_version['tool_calls'] = self.__content.get_tool_calls()
         if self.__content.get_tool_call_id():
@@ -563,6 +582,7 @@ class AIMessage:
             sticky = bool(d.get('sticky', False)),
             content_file_url = d.get('content_file_url', None),
             model = d.get('model', ''),
+            content_file_name = d.get('content_file_name'),
             tool_calls = d.get('tool_calls', None),
             tool_call_id = d.get('tool_call_id', ''),
             tool_name = d.get('tool_name', '')
@@ -579,6 +599,9 @@ class AIMessage:
 
     def get_file_url(self) -> "str | None":
         return self.__content.get_file_url()
+
+    def get_file_name(self) -> "str | None":
+        return self.__content.get_file_name()
     
     def get_text(self) -> str:
         return self.__content.get_text()
@@ -591,6 +614,7 @@ class AIMessage:
         #every semantic field but the text is carried over: editing the text of a tool message must
         #not silently drop its calls or its id
         self.__content.set_content(self.__content.get_type(), self.__content.get_image_url(), text, self.__content.get_file_url(),
+                                   self.__content.get_file_name(),
                                    tool_calls=self.__content.get_tool_calls(),
                                    tool_call_id=self.__content.get_tool_call_id(),
                                    tool_name=self.__content.get_tool_name())
@@ -653,9 +677,9 @@ class AIMessage:
         return self.__sticky
 
     def is_internal(self) -> bool:
-        """ True for AIC_TYPE_INTERNAL and AIC_TYPE_REASONING content.
+        """ True for internal records (commands, warnings, topic markers), reasoning and agent content.
 
-            CAREFUL: this is a property of the TYPE, and the two types behave differently.
+            CAREFUL: this is a property of the TYPE, and these types behave differently.
             AIC_TYPE_INTERNAL always implies ROLE_INTERNAL (the constructor refuses any other
             pairing) and never reaches memory. AIC_TYPE_REASONING normally carries role assistant,
             reports True here, and IS part of memory when add_reasoning=True.
@@ -843,6 +867,34 @@ class AIConversation:
         return self.__assistant_tokens
 
 
+    @staticmethod
+    def _migrate_legacy_message(role: str, msg_type: str, text: str) -> "tuple[str, str, bool]":
+        """ Repair known older message formats before file-load validation.
+
+            Internal reasoning becomes assistant reasoning; old /NEWTOPIC commands become typed
+            markers. Bookkeeping types move to the internal role, and agent records on roles that
+            cannot carry them become internal notes. Unknown roles, attachments and tool traffic
+            are left for normal validation rather than being degraded into text.
+        """
+        allowed_types = rc.AIC_ALLOWED_TYPES_BY_ROLE.get(role)
+        if allowed_types is None:
+            return role, msg_type, False
+        if role == rc.ROLE_INTERNAL and msg_type == rc.AIC_TYPE_REASONING:
+            return rc.ROLE_ASSISTANT, msg_type, True
+        if (role == rc.ROLE_INTERNAL and msg_type == rc.AIC_TYPE_INTERNAL
+                and isinstance(text, str) and text.strip().upper() == rc.AIC_COMMAND_NEWTOPIC):
+            return role, rc.AIC_TYPE_NEWTOPIC, True
+        if msg_type in allowed_types:
+            return role, msg_type, False
+        if msg_type in (rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_WARNING, rc.AIC_TYPE_NEWTOPIC):
+            return rc.ROLE_INTERNAL, msg_type, True
+        if msg_type == rc.AIC_TYPE_REASONING:
+            return rc.ROLE_ASSISTANT, msg_type, True
+        if msg_type == rc.AIC_TYPE_AGENT:
+            return rc.ROLE_INTERNAL, rc.AIC_TYPE_INTERNAL, True
+        return role, msg_type, False
+
+
     def load_conversation(self, full_path_name:str) -> None:
         """ Replace this conversation with the one stored in `full_path_name`.
 
@@ -850,6 +902,7 @@ class AIConversation:
             Only semantic fields are stored, so the content blocks are rebuilt on load and a file saved
             by an older version stays readable - every optional key is read through AIMessage.from_dict(),
             which defaults anything missing.
+            Known legacy role/type combinations and /NEWTOPIC markers are migrated before validation.
 
             A line that fails is REPORTED AND SKIPPED rather than aborting the load: one corrupt
             message should not cost the user the whole conversation. That covers unparseable JSON,
@@ -869,6 +922,7 @@ class AIConversation:
         """
         loaded: list[AIMessage] = []
         line_number:int = 0
+        migrated_count:int = 0
 
         with open(full_path_name, "r", encoding="utf-8") as file:
             for line in file:
@@ -881,7 +935,15 @@ class AIConversation:
                     message_dict = json.loads(stripped_line)
                     if not isinstance(message_dict, dict):
                         raise TypeError(f"expected a JSON object, got {type(message_dict).__name__}")
+                    new_role, new_type, was_migrated = self._migrate_legacy_message(
+                        message_dict.get('role'), message_dict.get('msg_type', rc.AIC_TYPE_TEXT),
+                        message_dict.get('content_text', ''))
+                    if was_migrated:
+                        message_dict['role'] = new_role
+                        message_dict['msg_type'] = new_type
                     new_message  = AIMessage.from_dict(message_dict)
+                    if was_migrated:
+                        migrated_count += 1
                 except (ValueError, KeyError, TypeError) as e:
                     #ValueError covers json.JSONDecodeError and every AIMessage validation failure
                     print(f"AIConversation.load_conversation() - Error loading line {line_number}: {e}")
@@ -897,6 +959,10 @@ class AIConversation:
                         loaded.insert(0, new_message)
                 else:
                     loaded.append(new_message)
+
+        if migrated_count:
+            printColor(f"AIConversation.load_conversation() - {migrated_count} message(s) upgraded from an older format. "
+                       "Save the conversation to keep the new format.", "yellow")
 
         #message 0 is always the system prompt: the whole class relies on it, so a file that is empty,
         #truncated, or simply does not start with one gets the default rather than leaving the
@@ -997,13 +1063,14 @@ class AIConversation:
         return
 
     def new_topic(self) -> None:
-        """ Draw a line under the conversation so far: append an internal AIC_COMMAND_NEWTOPIC marker.
+        """ Draw a line under the conversation so far: append a typed AIC_TYPE_NEWTOPIC marker.
 
             From here on memory stops at this marker, so the model sees the system prompt plus only
             what follows it. Nothing is deleted: the earlier messages stay in history and are still
             saved, shown by print() and returned by get_history_messages().
+            The marker retains the /NEWTOPIC text. Older internal /NEWTOPIC messages are also recognized.
         """
-        self.add_message(rc.ROLE_INTERNAL, rc.AIC_COMMAND_NEWTOPIC, rc.AIC_TYPE_INTERNAL)
+        self.add_message(rc.ROLE_INTERNAL, rc.AIC_COMMAND_NEWTOPIC, rc.AIC_TYPE_NEWTOPIC)
         return
     
     def add_comment(self, text:str) -> None:
@@ -1023,7 +1090,7 @@ class AIConversation:
         return
 
 
-    def add_message(self, msg_role:str, msg_text:str, msg_type:str=rc.AIC_TYPE_TEXT, image_url:"str | None" = None, is_sticky = False, file_url:"str | None" = None, model:str = "",
+    def add_message(self, msg_role:str, msg_text:str, msg_type:str=rc.AIC_TYPE_TEXT, image_url:"str | None" = None, is_sticky = False, file_url:"str | None" = None, model:str = "", file_name:"str | None" = None,
                     *, tool_calls: "list[dict[str, Any]] | None" = None, tool_call_id: str = "", tool_name: str = "") -> None:
         """ Append a message to the conversation.
 
@@ -1041,6 +1108,7 @@ class AIConversation:
                 is_sticky: keep this message in memory even once it falls outside the window.
                 file_url: required when msg_type is AIC_TYPE_FILE.
                 model: provenance, which model produced or received this message.
+                file_name: optional attachment filename, derived from a local file path when omitted.
                 tool_calls, tool_call_id, tool_name: the tool fields, keyword-only. Prefer the
                     named wrappers add_tool_call() and add_tool_result(), which document them.
 
@@ -1050,14 +1118,8 @@ class AIConversation:
         """
         #the prompt at message 0 is always sticky, like the one __init__ and change_system_message() install
         is_still_sticky:bool = is_sticky or msg_role in [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER]
-        if msg_role not in [rc.ROLE_USER, rc.ROLE_ASSISTANT, rc.ROLE_SYSTEM, rc.ROLE_INTERNAL, rc.ROLE_DEVELOPER, rc.ROLE_TOOL]:
-            raise ValueError(f"AIConversation.add_message - Invalid message role: {msg_role!r}")
-
-        if msg_type not in [rc.AIC_TYPE_TEXT, rc.AIC_TYPE_IMAGE_URL, rc.AIC_TYPE_FILE, rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_REASONING,
-                            rc.AIC_TYPE_TOOL_CALL, rc.AIC_TYPE_TOOL_RESULT]:
-            raise ValueError(f"AIConversation.add_message - Invalid message type: {msg_type!r}")
-
-        new_msg = AIMessage(msg_role, msg_text, msg_type, image_url, is_still_sticky, file_url, model,
+        #AIMessage validates the role/type contract before any history is changed.
+        new_msg = AIMessage(msg_role, msg_text, msg_type, image_url, is_still_sticky, file_url, model, file_name,
                             tool_calls=tool_calls, tool_call_id=tool_call_id, tool_name=tool_name)
 
         if msg_role in [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER]:
@@ -1130,7 +1192,8 @@ class AIConversation:
             list; the conversation only records it. See add_tool_call().
         """
         result = True
-        if message.get_role() == rc.ROLE_INTERNAL or message.get_type() == rc.AIC_TYPE_INTERNAL:
+        if message.get_role() == rc.ROLE_INTERNAL or message.get_type() in (
+                rc.AIC_TYPE_INTERNAL, rc.AIC_TYPE_WARNING, rc.AIC_TYPE_NEWTOPIC, rc.AIC_TYPE_AGENT):
             result = False
 
         if message.get_type() == rc.AIC_TYPE_REASONING and not add_reasoning:
@@ -1207,7 +1270,10 @@ class AIConversation:
 
         for message in reversed(self.__messages):
 
-            if message.get_role() == rc.ROLE_INTERNAL and message.get_text() == rc.AIC_COMMAND_NEWTOPIC:
+            if (message.get_type() == rc.AIC_TYPE_NEWTOPIC
+                    or (message.get_role() == rc.ROLE_INTERNAL
+                        and message.get_type() == rc.AIC_TYPE_INTERNAL
+                        and message.get_text() == rc.AIC_COMMAND_NEWTOPIC)):
                 new_topic_found = True
                 break
             elif message.get_role() in [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER]:
@@ -1676,6 +1742,8 @@ class AIConversation:
 
         Colour follows the role (user, assistant, system, internal). Data URLs are abbreviated to
         their first and last characters so a base64 image does not flood the terminal.
+        Numbers always refer to full history indices, including in memory and filtered views,
+        so they can be passed directly to get_ith_message(), remove_nth_message() and stickiness methods.
         """
 
         my_add_internal:bool = add_internal
@@ -1692,7 +1760,7 @@ class AIConversation:
         COLOR_INTERNAL:str     = "gray"
         COLOR_TOOL:str         = "light_magenta"   #tool traffic, both directions: distinct from what anyone SAID
 
-        counter:int = 0
+        history_indices = {id(message): index for index, message in enumerate(self.__messages)}
         printed_count:int = 0
 
         for message in temp_memory_list:
@@ -1705,6 +1773,10 @@ class AIConversation:
 
             if message.get_type() in rc.AIC_TOOL_TYPES:
                 THE_CONTENT_COLOR = COLOR_TOOL      #by TYPE, so the assistant's tool CALL is coloured as tool traffic too
+            elif message.get_type() in (rc.AIC_TYPE_REASONING, rc.AIC_TYPE_AGENT):
+                THE_CONTENT_COLOR = COLOR_INTERNAL
+            elif message.get_type() == rc.AIC_TYPE_WARNING:
+                THE_CONTENT_COLOR = "yellow"
             elif current_role == rc.ROLE_USER:
                 THE_CONTENT_COLOR = COLOR_USER
             elif current_role == rc.ROLE_ASSISTANT:
@@ -1716,9 +1788,7 @@ class AIConversation:
             else:
                 THE_CONTENT_COLOR = COLOR_USER
 
-            #everything below reads `message`, never temp_memory_list[counter]: counter is a display
-            #number that stops advancing on a skip, so using it as an index would print the wrong
-            #message for every entry after one
+            counter = history_indices[id(message)]
             text_content:str = message.get_text()
             if not text_only:
                 model_str:str = f", model={message.get_model()}" if message.get_model() else ""
@@ -1746,7 +1816,6 @@ class AIConversation:
                 for line in self.__tool_lines(message):
                     printColor(line, THE_CONTENT_COLOR)
             printed_count += 1
-            counter += 1
 
         return printed_count
 
@@ -1785,15 +1854,22 @@ class AIConversation:
             content_color = "light_white"  # Default to white
             if message.get_type() in rc.AIC_TOOL_TYPES:
                 content_color = "light_magenta"
+            elif message.get_type() in (rc.AIC_TYPE_REASONING, rc.AIC_TYPE_AGENT):
+                content_color = "gray"
+            elif message.get_type() == rc.AIC_TYPE_WARNING:
+                content_color = "yellow"
             elif message.get_role() == rc.ROLE_USER:
                 content_color = "light_white"
             elif message.get_role() == rc.ROLE_ASSISTANT:
                 content_color = "light_green"
             elif message.get_role() in [rc.ROLE_SYSTEM, rc.ROLE_DEVELOPER]:
                 content_color = "light_yellow"
+            elif message.get_role() == rc.ROLE_INTERNAL:
+                content_color = "gray"
 
             if not text_only:
-                printColor(f"{index} ------------------------------------------ {message.get_role().upper()} (type={message.get_type()}, sticky={message.is_sticky()}):", "light_cyan")
+                history_index = index % len(self.__messages)
+                printColor(f"{history_index} ------------------------------------------ {message.get_role().upper()} (type={message.get_type()}, sticky={message.is_sticky()}):", "light_cyan")
             if message.get_text() or message.get_type() not in rc.AIC_TOOL_TYPES:
                 printColor(f"{message.get_text()}\n", content_color)
 
@@ -1816,6 +1892,10 @@ class AIConversation:
         else:
             print(f"Invalid message index: {index}. Must be between {-len(self.__messages)} and {len(self.__messages) - 1}.")
         return result
+
+    def print_specific_message(self, index: int, text_only: bool = False) -> bool:
+        """ Alias for print_message_No(), accepting the same full-history indices. """
+        return self.print_message_No(index, text_only)
 
 ###########################################################
 #               MAIN - the tests live in test_AIConversation.py
